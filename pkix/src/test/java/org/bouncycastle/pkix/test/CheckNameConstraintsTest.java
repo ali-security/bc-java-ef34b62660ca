@@ -9,6 +9,7 @@ import java.security.Security;
 import java.security.cert.CertPath;
 import java.security.cert.CertPathBuilder;
 import java.security.cert.CertPathValidator;
+import java.security.cert.CertPathValidatorException;
 import java.security.cert.CertStore;
 import java.security.cert.CertificateFactory;
 import java.security.cert.CollectionCertStoreParameters;
@@ -57,6 +58,8 @@ public class CheckNameConstraintsTest
 {
     private static final String SUBJ_ALT_NAME_EXT_ERROR = "CertPathReviewer.subjAltNameExtError";
     private static final String NOT_PERMITTED_EMAIL = "CertPathReviewer.notPermittedEmail";
+    private static final String NOT_PERMITTED_DN = "CertPathReviewer.notPermittedDN";
+    private static final String EXCLUDED_DN = "CertPathReviewer.excludedDN";
 
     private static final int NAME_CHECK_MAX = 1024;
 
@@ -68,6 +71,7 @@ public class CheckNameConstraintsTest
     private static final X500Name CA1_NAME = new X500Name("CN=Name Constraints Test CA1");
     private static final X500Name CA2_NAME = new X500Name("CN=Name Constraints Test CA2");
     private static final X500Name LEAF_NAME = new X500Name("CN=Name Constraints Test Leaf");
+    private static final X500Name NC_INT_NAME = new X500Name("CN=NC Constrained Intermediate CA");
 
     private static BigInteger serialNumber = BigInteger.ONE;
 
@@ -350,13 +354,218 @@ public class CheckNameConstraintsTest
             goodReviewer.isValidCertPath());
     }
 
+    /**
+     * RFC 5280 sec. 6.1.3 (b) and (c) apply the accumulated name constraints to every
+     * certificate in the path, the target certificate included - the self-issued exemption in
+     * sec. 4.2.1.10 is waived for the final certificate, and sec. 6.1.5 (wrap-up) does not
+     * revisit name constraints. The PKIXCertPathReviewer drove the check from a loop
+     * bound of index &gt; 0, which is the bound the CA-only steps want; index 0 is the end-entity
+     * certificate under the standard CertPath ordering, so a leaf whose subject or SAN violated
+     * its issuing CA's constraints reviewed as valid with no errors at all, while
+     * CertPathValidator("PKIX") rejected the identical chain.
+     */
+    public void testNameConstraintsAppliedToLeaf()
+        throws Exception
+    {
+        X509Certificate intCert = generateConstrainedCA(new NameConstraints(
+            new GeneralSubtree[]{ new GeneralSubtree(dnsName("partner-a.example.com")) }, null));
+
+        // a leaf the constrained CA was never authorised to vouch for
+        CertPath badPath = generatePath(intCert, new X500Name("CN=attacker.evil.com"),
+            new GeneralNames(dnsName("attacker.evil.com")));
+
+        // ground truth: the trust-deciding validator rejects it
+        assertFalse("CertPathValidator accepted a name-constraint-violating leaf", validatorAccepts(badPath));
+
+        PKIXCertPathReviewer reviewer = review(badPath);
+        assertFalse("pkix reviewer accepted a name-constraint-violating leaf", reviewer.isValidCertPath());
+        assertTrue("pkix reviewer did not report the violation against the leaf, errors: " + errorIds(reviewer),
+            hasError(reviewer, 0, NOT_PERMITTED_EMAIL));
+
+        // compatibility control: a leaf inside the permitted subtree still reviews as valid
+        CertPath goodPath = generatePath(intCert, new X500Name("CN=host.partner-a.example.com"),
+            new GeneralNames(dnsName("host.partner-a.example.com")));
+
+        CertPathValidator.getInstance("PKIX", "BC").validate(goodPath, createParameters());
+
+        PKIXCertPathReviewer okReviewer = review(goodPath);
+        assertTrue("pkix reviewer rejected a compliant leaf, errors: " + errorIds(okReviewer),
+            okReviewer.isValidCertPath());
+    }
+
+    /**
+     * The excluded subtrees of the issuing CA must be applied to the leaf's subject
+     * alternative names too (RFC 5280 sec. 6.1.3 (c)).
+     */
+    public void testExcludedNameConstraintsAppliedToLeaf()
+        throws Exception
+    {
+        X509Certificate intCert = generateConstrainedCA(new NameConstraints(
+            null, new GeneralSubtree[]{ new GeneralSubtree(dnsName("evil.com")) }));
+
+        CertPath badPath = generatePath(intCert, new X500Name("CN=attacker.evil.com"),
+            new GeneralNames(dnsName("attacker.evil.com")));
+
+        assertFalse("CertPathValidator accepted a leaf in an excluded subtree", validatorAccepts(badPath));
+
+        PKIXCertPathReviewer reviewer = review(badPath);
+        assertFalse("pkix reviewer accepted a leaf in an excluded subtree", reviewer.isValidCertPath());
+        assertTrue("pkix reviewer did not report the excluded name against the leaf, errors: " + errorIds(reviewer),
+            hasError(reviewer, 0, NOT_PERMITTED_EMAIL));
+
+        CertPath goodPath = generatePath(intCert, new X500Name("CN=host.partner-a.example.com"),
+            new GeneralNames(dnsName("host.partner-a.example.com")));
+
+        CertPathValidator.getInstance("PKIX", "BC").validate(goodPath, createParameters());
+
+        PKIXCertPathReviewer okReviewer = review(goodPath);
+        assertTrue("pkix reviewer rejected a compliant leaf, errors: " + errorIds(okReviewer),
+            okReviewer.isValidCertPath());
+    }
+
+    /**
+     * The issuing CA's directoryName constraints must be applied to the leaf's subject DN,
+     * both the permitted (RFC 5280 sec. 6.1.3 (b)) and the excluded (sec. 6.1.3 (c)) subtrees.
+     */
+    public void testDNNameConstraintsAppliedToLeaf()
+        throws Exception
+    {
+        X509Certificate intCert = generateConstrainedCA(new NameConstraints(
+            new GeneralSubtree[]{ new GeneralSubtree(new GeneralName(new X500Name("C=US,O=Partner A"))) },
+            new GeneralSubtree[]{ new GeneralSubtree(new GeneralName(new X500Name("C=US,O=Partner A,OU=Revoked"))) }));
+
+        // subject outside of the permitted subtree
+        CertPath notPermittedPath = generatePath(intCert, new X500Name("C=US,O=Evil,CN=attacker"), null);
+
+        assertFalse("CertPathValidator accepted a leaf subject outside the permitted subtree",
+            validatorAccepts(notPermittedPath));
+
+        PKIXCertPathReviewer notPermittedReviewer = review(notPermittedPath);
+        assertFalse("pkix reviewer accepted a leaf subject outside the permitted subtree",
+            notPermittedReviewer.isValidCertPath());
+        assertTrue("pkix reviewer did not report the not permitted leaf subject, errors: "
+            + errorIds(notPermittedReviewer), hasError(notPermittedReviewer, 0, NOT_PERMITTED_DN));
+
+        // subject inside of the excluded subtree
+        CertPath excludedPath = generatePath(intCert, new X500Name("C=US,O=Partner A,OU=Revoked,CN=attacker"), null);
+
+        assertFalse("CertPathValidator accepted a leaf subject inside the excluded subtree",
+            validatorAccepts(excludedPath));
+
+        PKIXCertPathReviewer excludedReviewer = review(excludedPath);
+        assertFalse("pkix reviewer accepted a leaf subject inside the excluded subtree",
+            excludedReviewer.isValidCertPath());
+        assertTrue("pkix reviewer did not report the excluded leaf subject, errors: "
+            + errorIds(excludedReviewer), hasError(excludedReviewer, 0, EXCLUDED_DN));
+
+        // compatibility control: a subject inside the permitted subtree still reviews as valid
+        CertPath goodPath = generatePath(intCert, new X500Name("C=US,O=Partner A,CN=host"), null);
+
+        CertPathValidator.getInstance("PKIX", "BC").validate(goodPath, createParameters());
+
+        PKIXCertPathReviewer okReviewer = review(goodPath);
+        assertTrue("pkix reviewer rejected a compliant leaf subject, errors: " + errorIds(okReviewer),
+            okReviewer.isValidCertPath());
+    }
+
+    /**
+     * The self-issued exemption of RFC 5280 sec. 4.2.1.10 does not cover the final certificate in
+     * the path: a self-issued leaf (subject equal to its issuer, the constrained CA) must still be
+     * checked against the CA's name constraints.
+     */
+    public void testNameConstraintsAppliedToSelfIssuedLeaf()
+        throws Exception
+    {
+        X509Certificate intCert = generateConstrainedCA(new NameConstraints(
+            new GeneralSubtree[]{ new GeneralSubtree(dnsName("partner-a.example.com")) }, null));
+
+        CertPath badPath = generatePath(intCert, NC_INT_NAME, new GeneralNames(dnsName("attacker.evil.com")));
+
+        assertFalse("CertPathValidator accepted a name-constraint-violating self-issued leaf",
+            validatorAccepts(badPath));
+
+        PKIXCertPathReviewer reviewer = review(badPath);
+        assertFalse("pkix reviewer accepted a name-constraint-violating self-issued leaf",
+            reviewer.isValidCertPath());
+        assertTrue("pkix reviewer did not report the violation against the self-issued leaf, errors: "
+            + errorIds(reviewer), hasError(reviewer, 0, NOT_PERMITTED_EMAIL));
+
+        CertPath goodPath = generatePath(intCert, NC_INT_NAME, new GeneralNames(dnsName("host.partner-a.example.com")));
+
+        PKIXCertPathReviewer okReviewer = review(goodPath);
+        assertTrue("pkix reviewer rejected a compliant self-issued leaf, errors: " + errorIds(okReviewer),
+            okReviewer.isValidCertPath());
+    }
+
+    /**
+     * Issue a CA certificate for NC_INT_NAME under the test root, carrying the given name constraints.
+     */
+    private static X509Certificate generateConstrainedCA(NameConstraints nameConstraints)
+        throws Exception
+    {
+        return makeCertificate(ROOT_NAME, rootKp.getPrivate(), NC_INT_NAME, ca1Kp.getPublic(),
+            true, null, nameConstraints);
+    }
+
+    /**
+     * Create the path (leaf, intCert), the leaf being issued by intCert to the given subject.
+     */
+    private static CertPath generatePath(X509Certificate intCert, X500Name leafName, GeneralNames leafAltNames)
+        throws Exception
+    {
+        X509Certificate leafCert = makeCertificate(NC_INT_NAME, ca1Kp.getPrivate(), leafName, leafKp.getPublic(),
+            false, leafAltNames, null);
+
+        List chain = new ArrayList();
+        chain.add(leafCert);
+        chain.add(intCert);
+
+        return CertificateFactory.getInstance("X.509", "BC").generateCertPath(chain);
+    }
+
+    private static PKIXParameters createParameters()
+        throws Exception
+    {
+        Set trust = new HashSet();
+        trust.add(new TrustAnchor(rootCert, null));
+        PKIXParameters param = new PKIXParameters(trust);
+        param.setRevocationEnabled(false);
+
+        return param;
+    }
+
+    private static boolean validatorAccepts(CertPath certPath)
+        throws Exception
+    {
+        try
+        {
+            CertPathValidator.getInstance("PKIX", "BC").validate(certPath, createParameters());
+            return true;
+        }
+        catch (CertPathValidatorException e)
+        {
+            return false;
+        }
+    }
+
+    private static PKIXCertPathReviewer review(CertPath certPath)
+        throws Exception
+    {
+        PKIXCertPathReviewer certPathReviewer = new PKIXCertPathReviewer();
+        certPathReviewer.init(certPath, createParameters());
+
+        return certPathReviewer;
+    }
+
     private static PKIXCertPathReviewer reviewMaliciousPath(GeneralNames ca2AltNames)
         throws Exception
     {
         X509Certificate ca2Cert = makeCertificate(CA1_NAME, ca1Kp.getPrivate(), CA2_NAME, ca2Kp.getPublic(),
             true, ca2AltNames, null);
+        // the leaf is checked against the name constraints as well, so it carries the largest
+        // subject alternative name extension the reviewer is prepared to check.
         X509Certificate leafCert = makeCertificate(CA2_NAME, ca2Kp.getPrivate(), LEAF_NAME, leafKp.getPublic(),
-            false, createAltNames(MALICIOUS_ALT_NAME_COUNT, null), null);
+            false, createAltNames(NAME_CHECK_MAX, null), null);
 
         List certchain = new ArrayList();
         certchain.add(leafCert);
